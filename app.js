@@ -135,6 +135,11 @@ let measureLiveSvg = null; // persistent SVG on overlay during 2-click flow
 const pdfTextContent  = {};  // { pageNum: string } — for standards checker
 const _pageTextItems  = {};  // { pageNum: [{str,x,y,w,h,angle}] } — for select tool
 const _pageVectorGeom = {};  // { pageNum: {points:[{x,y}], segments:[{x1,y1,x2,y2}], grid:Map, cell} } — for snap-to-drawing
+// Real page size in PDF points (1pt = 1/72in) at pdf.js scale=1, per page —
+// saved into the .engdoc session alongside measureScale so external tools
+// (e.g. the CAD import side) can derive the sheet's true physical size
+// without the user re-entering it by hand.
+const pdfPageDimsPt   = {};  // { pageNum: {width, height} }
 
 function nextId() { return ++annotIdSeq; }
 
@@ -311,6 +316,7 @@ async function parseAndRenderPdfBytes(bytes) {
   nPages = pdf.numPages;
   renderedPages.clear(); renderQueue.clear();
   Object.keys(pdfTextContent).forEach(k => delete pdfTextContent[k]);
+  Object.keys(pdfPageDimsPt).forEach(k => delete pdfPageDimsPt[k]);
   Object.keys(_pageTextItems).forEach(k => delete _pageTextItems[k]);
   if (window._pageRawText) Object.keys(window._pageRawText).forEach(k => delete window._pageRawText[k]);
   Object.keys(_pageCache).forEach(k => delete _pageCache[k]); // stale page proxies from the previous doc must not leak in under the same page-number keys
@@ -477,6 +483,7 @@ async function resetToEmptyState() {
   history = []; historyIdx = -1; updateUndoRedoButtons();
   renderedPages.clear(); renderQueue.clear();
   Object.keys(pdfTextContent).forEach(k => delete pdfTextContent[k]);
+  Object.keys(pdfPageDimsPt).forEach(k => delete pdfPageDimsPt[k]);
   Object.keys(_pageTextItems).forEach(k => delete _pageTextItems[k]);
   if (window._pageRawText) Object.keys(window._pageRawText).forEach(k => delete window._pageRawText[k]);
   Object.keys(_pageCache).forEach(k => delete _pageCache[k]);
@@ -678,6 +685,7 @@ async function extractPdfTextBasic() {
       const page = await pdf.getPage(i);
       const tc = await page.getTextContent();
       const vp = page.getViewport({ scale: 1 }); // Use scale 1 for normalised coords
+      pdfPageDimsPt[i] = { width: vp.width, height: vp.height };
       pdfTextContent[i] = tc.items
         .filter(item => item.str && item.str.trim())
         .map(item => normalisePdfTextItem(item, vp));
@@ -4052,7 +4060,7 @@ async function _saveToHandle(data, filename) {
 
 function saveSession() {
   if (!pdfName && !annots.length) { toast('Nothing to save'); return; }
-  const data = { v: 2, pdfName, annotIdSeq, measureScale, annots, emmaRows };
+  const data = { v: 2, pdfName, annotIdSeq, measureScale, pageDimsPt: pdfPageDimsPt, annots, emmaRows };
   const filename = _loadedEngdocName || (pdfName ? pdfName.replace(/\.pdf$/i,'') : 'session') + '.engdoc';
   _saveToHandle(data, filename).then(ok => {
     if (ok) toast(`✓ Session saved — ${annots.length} annotation${annots.length !== 1 ? 's' : ''}`);
@@ -4069,7 +4077,7 @@ async function saveSessionWithPdf() {
     binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
   }
   const b64 = btoa(binary);
-  const data = { v: 3, pdfName, annotIdSeq, measureScale, annots, emmaRows, pdfData: b64 };
+  const data = { v: 3, pdfName, annotIdSeq, measureScale, pageDimsPt: pdfPageDimsPt, annots, emmaRows, pdfData: b64 };
   const filename = _loadedEngdocName || (pdfName ? pdfName.replace(/\.pdf$/i,'') : 'session') + '.engdoc';
   const ok = await _saveToHandle(data, filename);
   if (ok) toast(`✓ Saved with embedded PDF — ${sizeMb} MB`);
@@ -6796,6 +6804,7 @@ async function extractPdfText() {
         const tc   = await page.getTextContent();
         if (myGen !== docGen) return;
         const vp   = page.getViewport({ scale: 1 });
+        pdfPageDimsPt[pg] = { width: vp.width, height: vp.height };
 
         return new Promise(res => {
           const handler = e => {
