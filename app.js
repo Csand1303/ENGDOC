@@ -3213,14 +3213,49 @@ function _msCalibrate() {
 // Nearest N scanned elements to a page-percent point, for the replace-text
 // candidate picker — sorted closest first, flagged when their label isn't
 // unique in the drawing.
-function _msNearestCandidates(xPct, yPct, limit) {
+function _msNearestCandidates(xPct, yPct, limit, correction) {
   if (!_msScan || !_msCalibration) return [];
-  const [px, py] = _msProjectPoint(xPct, yPct, _msCalibration);
+  let [px, py] = _msProjectPoint(xPct, yPct, _msCalibration);
+  if (correction) { px += correction.dx; py += correction.dy; }
   return _msScan.texts
     .map(t => ({ ...t, dist: Math.hypot(t.x - px, t.y - py),
                  duplicate: (_msTextCounts[_normText(t.text)] || 0) > 1 }))
     .sort((a, b) => a.dist - b.dist)
     .slice(0, limit || 5);
+}
+
+// A table row's own label (e.g. "TAIL HT.") is far more likely to be
+// unique in the drawing than the bare value next to it ("6.000") — and in
+// a dense table, row-to-row spacing can be smaller than the whole-page
+// calibration's own precision, so several rows' values compete for
+// "nearest" even though the fit isn't really wrong, just not that precise
+// everywhere. If a unique-labelled neighbour sits on the same line, its
+// own predicted-vs-actual offset is a much tighter, purely local
+// correction for this one click than trusting the whole-page fit alone.
+function _msLocalCorrection(pageNum, xPct, yPct) {
+  if (!_msScan || !_msCalibration) return null;
+  const vp = pageViewports[pageNum];
+  const items = _pageTextItems[pageNum];
+  if (!vp || !items) return null;
+
+  const xPx = (xPct / 100) * vp.width, yPx = (yPct / 100) * vp.height;
+  let best = null;
+  items.forEach(it => {
+    if (Math.abs(it.x - xPx) < 1 && Math.abs(it.y - yPx) < 1) return; // the clicked item itself
+    const avgH = it.h || 12;
+    if (Math.abs(it.y - yPx) > avgH * 0.6) return; // not the same line
+    const key = _normText(it.str);
+    if (!key) return;
+    const cands = _msScan.texts.filter(t => _normText(t.text) === key);
+    if (cands.length !== 1) return; // only trust an unambiguous neighbour
+    const dist = Math.abs(it.x - xPx);
+    if (!best || dist < best.dist) best = { dist, item: it, ms: cands[0] };
+  });
+  if (!best) return null;
+
+  const itPctX = (best.item.x / vp.width) * 100, itPctY = (best.item.y / vp.height) * 100;
+  const [px, py] = _msProjectPoint(itPctX, itPctY, _msCalibration);
+  return { dx: best.ms.x - px, dy: best.ms.y - py, via: best.ms.text };
 }
 
 async function loadDrawingScan(e) {
@@ -3267,15 +3302,19 @@ function _rtpReadingOrder(items) {
   });
 }
 
-function _rtpRenderCandidates(candidates, selectedEid) {
+function _rtpRenderCandidates(candidates, correctionVia) {
   const box = document.getElementById('rtp-candidates');
   if (!candidates || !candidates.length) { box.innerHTML = ''; box.hidden = true; return; }
   box.hidden = false;
+  const correctionNote = correctionVia
+    ? `<div class="rtp-correction-note">↳ position refined using nearby "${escHtml(correctionVia)}"</div>`
+    : '';
   box.innerHTML = '<div class="sp-label" style="margin:8px 0 4px">Bind to drawing element</div>' +
+    correctionNote +
     candidates.map((c, i) => `
       <label class="rtp-cand">
         <input type="radio" name="rtp-target" value="${escHtml(c.eid)}" ${i === 0 ? 'checked' : ''}>
-        <span class="rtp-cand-text">${escHtml(c.text)}</span>
+        <span class="rtp-cand-text">${escHtml(c.text)} <span class="rtp-cand-eid">#${escHtml(c.eid)}</span></span>
         <span class="rtp-cand-dist">${c.dist.toFixed(3)}${c.duplicate ? ' · ⚠ dup label' : ''}</span>
       </label>`).join('');
 }
@@ -3285,11 +3324,11 @@ function _rtpSelectedTargetEid() {
   return checked ? checked.value : null;
 }
 
-function _rtpOpen(oldText, prefill, cx, cy, candidates) {
+function _rtpOpen(oldText, prefill, cx, cy, candidates, correctionVia) {
   document.getElementById('rtp-original').textContent = oldText || '(no original text on record)';
   const input = document.getElementById('rtp-input');
   input.value = prefill || '';
-  _rtpRenderCandidates(candidates);
+  _rtpRenderCandidates(candidates, correctionVia);
 
   const pop = document.getElementById('replace-text-pop');
   pop.style.left = '0'; pop.style.top = '0';
@@ -3330,16 +3369,21 @@ function openReplaceTextPopover(items, pageNum, ov, cx, cy) {
     origX, origY,
   };
 
-  const candidates = _msNearestCandidates(origX, origY, 5);
-  _rtpOpen(oldText, '', cx, cy, candidates);
+  const correction = _msLocalCorrection(pageNum, origX, origY);
+  const candidates = _msNearestCandidates(origX, origY, 5, correction);
+  _rtpOpen(oldText, '', cx, cy, candidates, correction && correction.via);
 }
 
 // "Replace text…" from the ctx-menu on an existing type:'text' note — lets
 // you correct/retype the replacement without deleting and re-creating it.
 function openReplaceTextPopoverForEdit(a, cx, cy) {
   _rtpState = { mode: 'edit', annotId: a.id };
-  const candidates = (a.origX !== undefined) ? _msNearestCandidates(a.origX, a.origY, 5) : [];
-  _rtpOpen(a.origText || '', a.text || '', cx, cy, candidates);
+  let candidates = [], correction = null;
+  if (a.origX !== undefined) {
+    correction = _msLocalCorrection(a.pageNum, a.origX, a.origY);
+    candidates = _msNearestCandidates(a.origX, a.origY, 5, correction);
+  }
+  _rtpOpen(a.origText || '', a.text || '', cx, cy, candidates, correction && correction.via);
 }
 
 function cancelReplaceText() {
