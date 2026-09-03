@@ -2951,27 +2951,6 @@ function attachOverlayCtxMenu(ov) {
   ov.addEventListener('contextmenu', ev => {
     ev.preventDefault();
 
-    // 0. Select tool: right-clicking PDF text (an active drag/point selection,
-    // or — if nothing's selected yet — whatever word sits under the cursor)
-    // opens "Replace text" instead of the normal annotation/quick-tool menus.
-    if (tool === 'select') {
-      const pageN = parseInt(ov.dataset.page);
-      let items = _selHits.length ? _selHits : null;
-      if (!items) {
-        const r = ov.getBoundingClientRect();
-        const cx = ev.clientX - r.left, cy = ev.clientY - r.top;
-        const pool = _pageTextItems[pageN] || [];
-        const hit = pool.find(item => _rectHitsItem(cx - 2, cy - 2, 4, 4, item));
-        if (hit) items = [hit];
-      }
-      if (items && items.length) {
-        ev.stopPropagation();
-        hideQuickToolbar(); hideCtx();
-        openReplaceTextPopover(items, pageN, ov, ev.clientX, ev.clientY);
-        return;
-      }
-    }
-
     // 1. Try to find [data-aid] or [data-svg-proxy-for] by walking up DOM
     let annotId = null;
     let t = ev.target;
@@ -3000,8 +2979,37 @@ function attachOverlayCtxMenu(ov) {
       });
       if (hits.length) annotId = hits[hits.length - 1].id;
     }
-    if (annotId) { ev.stopPropagation(); hideQuickToolbar(); openCtxMenu(annotId, ev.clientX, ev.clientY); }
-    else { ev.stopPropagation(); hideCtx(); openQuickToolbar(ev.clientX, ev.clientY); }
+    if (annotId) {
+      // An annotation is already sitting under the cursor — show its own
+      // menu (which includes "Replace text…" for type:'text' notes) rather
+      // than reaching past it for the PDF text underneath.
+      ev.stopPropagation(); hideQuickToolbar();
+      openCtxMenu(annotId, ev.clientX, ev.clientY);
+      return;
+    }
+
+    // 3. Nothing annotated here — right-clicking PDF text (an active
+    // drag/point selection, or — if nothing's selected yet — whatever word
+    // sits under the cursor) opens "Replace text" instead of the quick
+    // toolbar. Works in every tool (not just Select) since no tool other
+    // than Select uses the right mouse button for anything of its own.
+    const pageN = parseInt(ov.dataset.page);
+    let items = _selHits.length ? _selHits : null;
+    if (!items) {
+      const r = ov.getBoundingClientRect();
+      const cx = ev.clientX - r.left, cy = ev.clientY - r.top;
+      const pool = _pageTextItems[pageN] || [];
+      const hit = pool.find(item => _rectHitsItem(cx - 2, cy - 2, 4, 4, item));
+      if (hit) items = [hit];
+    }
+    if (items && items.length) {
+      ev.stopPropagation();
+      hideQuickToolbar(); hideCtx();
+      openReplaceTextPopover(items, pageN, ov, ev.clientX, ev.clientY);
+      return;
+    }
+
+    ev.stopPropagation(); hideCtx(); openQuickToolbar(ev.clientX, ev.clientY);
   }, true); // capture — fires regardless of child pointer-events
 }
 
@@ -3011,7 +3019,16 @@ function attachOverlayCtxMenu(ov) {
 // with the replacement. Saved/loaded exactly like any other note (.engdoc
 // format), which is what atlas_engine's parse_engdoc()/match_notes() already
 // consume on the Atlas CAD side to write the replacement into the drawing.
-let _rtpState = null; // { items, pageNum, ov } while the popover is open
+//
+// origX/origY record the *true* anchor of the original PDF text (its
+// left/baseline point, in the same convention pdf.js and MicroStation both
+// use for a text element's own origin) separately from x/y, which stay the
+// annotation's visual bounding-box corner so rendering/hit-testing are
+// unaffected. atlas_engine.parse_engdoc() prefers origX/origY when present —
+// they line up with a scanned DGN text element's origin far better than an
+// arbitrary box corner would, which measurably improves match_notes()'s
+// nearest-element matching on drawings with closely-spaced text.
+let _rtpState = null; // { mode:'create', items, pageNum, ov } | { mode:'edit', annotId }
 
 function _rtpReadingOrder(items) {
   return [...items].sort((a, b) => {
@@ -3022,16 +3039,10 @@ function _rtpReadingOrder(items) {
   });
 }
 
-function openReplaceTextPopover(items, pageNum, ov, cx, cy) {
-  const ordered = _rtpReadingOrder(items);
-  const oldText = ordered.map(h => h.str).join(' ').replace(/\s+/g, ' ').trim();
-  if (!oldText) return;
-
-  _rtpState = { items: ordered, pageNum, ov };
-
-  document.getElementById('rtp-original').textContent = oldText;
+function _rtpOpen(oldText, prefill, cx, cy) {
+  document.getElementById('rtp-original').textContent = oldText || '(no original text on record)';
   const input = document.getElementById('rtp-input');
-  input.value = '';
+  input.value = prefill || '';
 
   const pop = document.getElementById('replace-text-pop');
   pop.style.left = '0'; pop.style.top = '0';
@@ -3039,7 +3050,24 @@ function openReplaceTextPopover(items, pageNum, ov, cx, cy) {
   const pw = pop.offsetWidth, ph = pop.offsetHeight;
   pop.style.left = Math.min(cx, window.innerWidth  - pw - 8) + 'px';
   pop.style.top  = Math.min(cy, window.innerHeight - ph - 8) + 'px';
-  setTimeout(() => input.focus(), 30);
+  setTimeout(() => { input.focus(); input.select(); }, 30);
+}
+
+// Right-click on raw PDF text with nothing already annotated there.
+function openReplaceTextPopover(items, pageNum, ov, cx, cy) {
+  const ordered = _rtpReadingOrder(items);
+  const oldText = ordered.map(h => h.str).join(' ').replace(/\s+/g, ' ').trim();
+  if (!oldText) return;
+
+  _rtpState = { mode: 'create', items: ordered, pageNum, ov };
+  _rtpOpen(oldText, '', cx, cy);
+}
+
+// "Replace text…" from the ctx-menu on an existing type:'text' note — lets
+// you correct/retype the replacement without deleting and re-creating it.
+function openReplaceTextPopoverForEdit(a, cx, cy) {
+  _rtpState = { mode: 'edit', annotId: a.id };
+  _rtpOpen(a.origText || '', a.text || '', cx, cy);
 }
 
 function cancelReplaceText() {
@@ -3052,23 +3080,44 @@ function confirmReplaceText() {
   const newText = document.getElementById('rtp-input').value.trim();
   if (!newText) { toast('Enter replacement text'); return; }
 
+  if (_rtpState.mode === 'edit') {
+    const a = annots.find(x => x.id === _rtpState.annotId);
+    if (a) {
+      if (!a.origText) a.origText = a.text;
+      a.text = newText;
+      a.replacesText = true;
+      syncAnnots(); updateAnnotPanel(); updateEmmaRegister(); snapshotState();
+      toast('Replacement updated');
+    }
+    cancelReplaceText();
+    return;
+  }
+
   const { items, pageNum, ov } = _rtpState;
-  const oldText = items.map(h => h.str).join(' ').replace(/\s+/g, ' ').trim();
+  const ordered = items; // already reading-order sorted by the caller
+  const oldText = ordered.map(h => h.str).join(' ').replace(/\s+/g, ' ').trim();
 
   // Bounding box of the selected text run, in CSS px (_pageTextItems stores
-  // y as the text baseline, growing downward, same convention as _selHighlight).
+  // y as the text baseline, growing downward, same convention as _selHighlight)
+  // — used for the note's visual size/position, unchanged from before.
   let minX = Infinity, minTop = Infinity, maxX = -Infinity, maxBottom = -Infinity;
-  items.forEach(it => {
+  ordered.forEach(it => {
     const top = it.y - it.h, bottom = it.y;
     minX = Math.min(minX, it.x); maxX = Math.max(maxX, it.x + it.w);
     minTop = Math.min(minTop, top); maxBottom = Math.max(maxBottom, bottom);
   });
+
+  // True anchor for CAD matching: the first (reading-order) item's own
+  // left/baseline point — a real point straight from the PDF's text
+  // transform, not a derived box corner.
+  const anchor = ordered[0];
 
   const ow = ov.offsetWidth, oh = ov.offsetHeight;
   pushAnnot({
     id: nextId(), pageNum, type: 'text',
     x: (minX / ow) * 100, y: (minTop / oh) * 100,
     w: ((maxX - minX) / ow) * 100, h: ((maxBottom - minTop) / oh) * 100,
+    origX: (anchor.x / ow) * 100, origY: (anchor.y / oh) * 100,
     text: newText, origText: oldText, replacesText: true,
     Color: 'black', box: true, textAlign: 'center', vAlign: 'center',
     emmaExclude: true,
@@ -3854,8 +3903,9 @@ function openCtxMenu(annotId, cx, cy) {
   const isTextable = a && ['text'].includes(a.type);
   const hasStatus  = a && ['text'].includes(a.type);
   const isImage    = a && a.type === 'image';
-  document.getElementById('ctx-edit').style.display   = isTextable ? 'flex' : 'none';
-  document.getElementById('ctx-resize').style.display = isImage    ? 'flex' : 'none';
+  document.getElementById('ctx-edit').style.display    = isTextable ? 'flex' : 'none';
+  document.getElementById('ctx-replace').style.display  = isTextable ? 'flex' : 'none';
+  document.getElementById('ctx-resize').style.display   = isImage    ? 'flex' : 'none';
 
   // Show status items only for text-bearing annotations
   ['ctx-status-label','ctx-status-open','ctx-status-progress',
@@ -3888,6 +3938,15 @@ function ctxEdit() {
   if (ctxAnnotId == null) { hideCtx(); return; }
   editAnnotById(ctxAnnotId);
   hideCtx(); ctxAnnotId = null;
+}
+
+function ctxReplaceText(ev) {
+  if (ctxAnnotId == null) { hideCtx(); return; }
+  const a = annots.find(x => x.id === ctxAnnotId);
+  const cx = ev ? ev.clientX : window.innerWidth / 2;
+  const cy = ev ? ev.clientY : window.innerHeight / 2;
+  hideCtx(); ctxAnnotId = null;
+  if (a) openReplaceTextPopoverForEdit(a, cx, cy);
 }
 
 function ctxResizeImage() {
