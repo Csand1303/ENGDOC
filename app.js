@@ -3083,6 +3083,14 @@ function _msFitSimilarity(points) {
 }
 
 function _msProjectPoint(xPct, yPct, calibration) {
+  if (calibration.mode === 'range') {
+    // Direct, exact mapping — no fitting involved. See _msCalibrate()'s
+    // comment on why this is preferred whenever the scan carries a usable
+    // model range.
+    const spanX = calibration.max_x - calibration.min_x;
+    const spanY = calibration.max_y - calibration.min_y;
+    return [calibration.min_x + (xPct / 100) * spanX, calibration.max_y - (yPct / 100) * spanY];
+  }
   const k = { re: calibration.k_re, im: calibration.k_im };
   const p = { re: xPct, im: -yPct };
   const originP = { re: calibration.origin_p_x, im: calibration.origin_p_y };
@@ -3139,6 +3147,23 @@ function _msCalibrate() {
     (msByText[k] = msByText[k] || []).push(t);
     _msTextCounts[k] = (_msTextCounts[k] || 0) + 1;
   });
+
+  // If the scan carries the model's overall range — the sheet border,
+  // per atlas_engine's _model_range() — and this bundle was printed by
+  // fitting that exact range to the page (export_bundle_for_engdoc's
+  // PrintDescription.Maximize()), the page<->model relationship is exact
+  // BY CONSTRUCTION: the same sheet, same scale, filling the same page.
+  // There's nothing to fit or guess here, so use it directly rather than
+  // inferring an approximate transform from matched text — that's only a
+  // fallback for scans that don't carry a usable range at all (GetRange()
+  // was unavailable and _model_range() fell back to the scanned text's
+  // own bounding box, which is NOT the sheet border, or an older/plain
+  // scan file with no range).
+  const range = _msScan.range;
+  if (range && range.max_x > range.min_x && range.max_y > range.min_y) {
+    _msCalibration = { mode: 'range', min_x: range.min_x, min_y: range.min_y, max_x: range.max_x, max_y: range.max_y };
+    return;
+  }
 
   const pageItems = _msPagePercentItems();
   if (!pageItems.length) return;
@@ -3213,15 +3238,37 @@ function _msCalibrate() {
 // Nearest N scanned elements to a page-percent point, for the replace-text
 // candidate picker — sorted closest first, flagged when their label isn't
 // unique in the drawing.
-function _msNearestCandidates(xPct, yPct, limit, correction) {
-  if (!_msScan || !_msCalibration) return [];
+// We know the exact original text being replaced (origText) — so the first
+// and strongest signal is simply: does that text exist anywhere in the
+// scan at all? If it does, ANY element bearing it is a vastly more
+// trustworthy candidate than something merely nearby with unrelated
+// content, however tight the calibration. Position only has to break a
+// tie when the text turns out to be duplicated — it never has to guess
+// blind among unrelated labels the way ranking by distance alone did.
+// Returns { textMatches: [...], nearby: [...] } — nearby is the
+// position-only fallback, always computed too, in case the true element's
+// text has since changed and isn't in the scan verbatim.
+function _msFindCandidates(origText, xPct, yPct, limit, correction) {
+  if (!_msScan || !_msCalibration) return { textMatches: [], nearby: [] };
   let [px, py] = _msProjectPoint(xPct, yPct, _msCalibration);
   if (correction) { px += correction.dx; py += correction.dy; }
-  return _msScan.texts
-    .map(t => ({ ...t, dist: Math.hypot(t.x - px, t.y - py),
-                 duplicate: (_msTextCounts[_normText(t.text)] || 0) > 1 }))
+
+  const withDist = t => ({ ...t, dist: Math.hypot(t.x - px, t.y - py),
+                            duplicate: (_msTextCounts[_normText(t.text)] || 0) > 1 });
+
+  const key = _normText(origText);
+  const textMatches = key
+    ? _msScan.texts.filter(t => _normText(t.text) === key).map(withDist).sort((a, b) => a.dist - b.dist)
+    : [];
+
+  const matchedEids = new Set(textMatches.map(t => t.eid));
+  const nearby = _msScan.texts
+    .filter(t => !matchedEids.has(t.eid))
+    .map(withDist)
     .sort((a, b) => a.dist - b.dist)
     .slice(0, limit || 5);
+
+  return { textMatches, nearby };
 }
 
 // A table row's own label (e.g. "TAIL HT.") is far more likely to be
@@ -3302,21 +3349,41 @@ function _rtpReadingOrder(items) {
   });
 }
 
-function _rtpRenderCandidates(candidates, correctionVia) {
+function _rtpCandRow(c, checked) {
+  return `
+      <label class="rtp-cand">
+        <input type="radio" name="rtp-target" value="${escHtml(c.eid)}" ${checked ? 'checked' : ''}>
+        <span class="rtp-cand-text">${escHtml(c.text)} <span class="rtp-cand-eid">#${escHtml(c.eid)}</span></span>
+        <span class="rtp-cand-dist">${c.dist.toFixed(3)}${c.duplicate ? ' · ⚠ dup label' : ''}</span>
+      </label>`;
+}
+
+function _rtpRenderCandidates(found, correctionVia) {
   const box = document.getElementById('rtp-candidates');
-  if (!candidates || !candidates.length) { box.innerHTML = ''; box.hidden = true; return; }
+  const textMatches = (found && found.textMatches) || [];
+  const nearby = (found && found.nearby) || [];
+  if (!textMatches.length && !nearby.length) { box.innerHTML = ''; box.hidden = true; return; }
   box.hidden = false;
+
   const correctionNote = correctionVia
     ? `<div class="rtp-correction-note">↳ position refined using nearby "${escHtml(correctionVia)}"</div>`
     : '';
-  box.innerHTML = '<div class="sp-label" style="margin:8px 0 4px">Bind to drawing element</div>' +
-    correctionNote +
-    candidates.map((c, i) => `
-      <label class="rtp-cand">
-        <input type="radio" name="rtp-target" value="${escHtml(c.eid)}" ${i === 0 ? 'checked' : ''}>
-        <span class="rtp-cand-text">${escHtml(c.text)} <span class="rtp-cand-eid">#${escHtml(c.eid)}</span></span>
-        <span class="rtp-cand-dist">${c.dist.toFixed(3)}${c.duplicate ? ' · ⚠ dup label' : ''}</span>
-      </label>`).join('');
+
+  let html = '<div class="sp-label" style="margin:8px 0 4px">Bind to drawing element</div>' + correctionNote;
+
+  if (textMatches.length) {
+    html += `<div class="rtp-group-label">Exact text match${textMatches.length > 1 ? ` (${textMatches.length} — nearest picked by position)` : ''}</div>`;
+    html += textMatches.map((c, i) => _rtpCandRow(c, i === 0)).join('');
+    if (nearby.length) {
+      html += '<div class="rtp-group-label rtp-group-muted">Other nearby (no text match)</div>';
+      html += nearby.map(c => _rtpCandRow(c, false)).join('');
+    }
+  } else {
+    html += '<div class="rtp-group-label rtp-warn">⚠ No element with this exact text found anywhere in the scan — showing nearest by position only, verify carefully</div>';
+    html += nearby.map((c, i) => _rtpCandRow(c, i === 0)).join('');
+  }
+
+  box.innerHTML = html;
 }
 
 function _rtpSelectedTargetEid() {
@@ -3370,20 +3437,20 @@ function openReplaceTextPopover(items, pageNum, ov, cx, cy) {
   };
 
   const correction = _msLocalCorrection(pageNum, origX, origY);
-  const candidates = _msNearestCandidates(origX, origY, 5, correction);
-  _rtpOpen(oldText, '', cx, cy, candidates, correction && correction.via);
+  const found = _msFindCandidates(oldText, origX, origY, 5, correction);
+  _rtpOpen(oldText, '', cx, cy, found, correction && correction.via);
 }
 
 // "Replace text…" from the ctx-menu on an existing type:'text' note — lets
 // you correct/retype the replacement without deleting and re-creating it.
 function openReplaceTextPopoverForEdit(a, cx, cy) {
   _rtpState = { mode: 'edit', annotId: a.id };
-  let candidates = [], correction = null;
+  let found = { textMatches: [], nearby: [] }, correction = null;
   if (a.origX !== undefined) {
     correction = _msLocalCorrection(a.pageNum, a.origX, a.origY);
-    candidates = _msNearestCandidates(a.origX, a.origY, 5, correction);
+    found = _msFindCandidates(a.origText || '', a.origX, a.origY, 5, correction);
   }
-  _rtpOpen(a.origText || '', a.text || '', cx, cy, candidates, correction && correction.via);
+  _rtpOpen(a.origText || '', a.text || '', cx, cy, found, correction && correction.via);
 }
 
 function cancelReplaceText() {
