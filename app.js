@@ -3006,7 +3006,7 @@ function attachOverlayCtxMenu(ov) {
       const cx = ev.clientX - r.left, cy = ev.clientY - r.top;
       const pool = _pageTextItems[pageN] || [];
       const hit = pool.find(item => _rectHitsItem(cx - 2, cy - 2, 4, 4, item));
-      if (hit) items = _msTextBlockAt(pageN, hit);
+      if (hit) items = _msExpandToMatch(pageN, hit);
     }
     if (items && items.length) {
       ev.stopPropagation();
@@ -3142,8 +3142,16 @@ function _msPagePercentItems() {
 // horizontal alignment breaks from what a single multi-line block would
 // look like, so an unrelated line just above/below (a different label
 // entirely) doesn't get swept in.
-const _MS_BLOCK_LINE_GAP_FACTOR = 1.8; // max gap between consecutive lines, as a multiple of their average height
-const _MS_BLOCK_X_OVERLAP_MIN = 0.3;   // min horizontal overlap (fraction of the narrower item's width) to count as "same block"
+// Deliberately generous — this only defines the SEARCH SPACE that
+// _msExpandToMatch() (below) then validates against the actual scan text,
+// so over-including a candidate line here is harmless (it just never gets
+// used unless it's actually needed for a match); under-including one is
+// fatal, since no amount of validation can recover a line that was never
+// considered. Real drawings' line spacing/alignment varies enough by font
+// and cell that tight thresholds were silently excluding real lines
+// (e.g. a 3-line label where only the first line got picked up).
+const _MS_BLOCK_LINE_GAP_FACTOR = 3.5; // max gap between consecutive lines, as a multiple of their average height
+const _MS_BLOCK_X_OVERLAP_MIN = 0.1;   // min horizontal overlap (fraction of the narrower item's width) to count as "same block"
 
 function _msTextBlockAt(pageNum, clickedItem) {
   const items = (_pageTextItems[pageNum] || []).filter(it => it.str && it.str.trim());
@@ -3177,6 +3185,39 @@ function _msTextBlockAt(pageNum, clickedItem) {
     cur = cand;
   }
   return block;
+}
+
+// Geometry alone can't reliably say how many lines belong together — real
+// drawings vary too much in spacing/alignment for any fixed threshold to
+// get right every time (proven the hard way: a 3-line cell label only
+// picking up its first line). Whenever a scan is loaded, use it as ground
+// truth instead of guessing: within the geometrically-plausible block
+// around the clicked line, try every contiguous grouping that includes it
+// — smallest first — and use the first one whose joined text actually
+// matches something in the scan. Falls back to pure geometry (or just the
+// single clicked line) when no scan is loaded yet, or nothing matches at
+// any size.
+function _msExpandToMatch(pageNum, clickedItem) {
+  const geoBlock = _msTextBlockAt(pageNum, clickedItem);
+  if (!_msScan || !_msScan.texts.length) return geoBlock;
+
+  const ordered = _rtpReadingOrder(geoBlock);
+  const idxOfClicked = ordered.indexOf(clickedItem);
+  if (idxOfClicked === -1) return geoBlock;
+
+  for (let size = 1; size <= ordered.length; size++) {
+    for (let start = Math.max(0, idxOfClicked - size + 1); start <= idxOfClicked; start++) {
+      const end = start + size;
+      if (end > ordered.length) continue;
+      const candidate = ordered.slice(start, end);
+      if (!candidate.includes(clickedItem)) continue;
+      const key = _normText(_msJoinBlockText(candidate));
+      if (key && _msScan.texts.some(t => _normText(t.text) === key)) {
+        return candidate;
+      }
+    }
+  }
+  return [clickedItem];
 }
 
 // Joins a set of text items into a string that preserves line structure —
