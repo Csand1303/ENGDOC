@@ -640,6 +640,17 @@
   </div>
 </div>
 
+<!-- REPLACE TEXT POPOVER — right-click a selected PDF text run to overlay it with a replacement note -->
+<div id="replace-text-pop">
+  <div class="sp-label">Replace Text</div>
+  <div id="rtp-original"></div>
+  <textarea id="rtp-input" placeholder="Replacement text…"></textarea>
+  <div class="rtp-actions">
+    <button class="hbtn outline" style="padding:5px 11px;font-size:12px" onclick="cancelReplaceText()">Cancel</button>
+    <button class="hbtn primary" style="padding:5px 11px;font-size:12px" onclick="confirmReplaceText()">Replace</button>
+  </div>
+</div>
+
 <!-- QUICK TOOL TOOLBAR — right-click on empty drawing space for one-click tool access -->
 <div id="ctx-quickbar">
   <button class="qtb-item" data-tool="pan" onclick="quickTool('pan')">

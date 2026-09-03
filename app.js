@@ -2950,6 +2950,28 @@ function attachOverlayCtxMenu(ov) {
   ov._ctxHandlerAttached = true;
   ov.addEventListener('contextmenu', ev => {
     ev.preventDefault();
+
+    // 0. Select tool: right-clicking PDF text (an active drag/point selection,
+    // or — if nothing's selected yet — whatever word sits under the cursor)
+    // opens "Replace text" instead of the normal annotation/quick-tool menus.
+    if (tool === 'select') {
+      const pageN = parseInt(ov.dataset.page);
+      let items = _selHits.length ? _selHits : null;
+      if (!items) {
+        const r = ov.getBoundingClientRect();
+        const cx = ev.clientX - r.left, cy = ev.clientY - r.top;
+        const pool = _pageTextItems[pageN] || [];
+        const hit = pool.find(item => _rectHitsItem(cx - 2, cy - 2, 4, 4, item));
+        if (hit) items = [hit];
+      }
+      if (items && items.length) {
+        ev.stopPropagation();
+        hideQuickToolbar(); hideCtx();
+        openReplaceTextPopover(items, pageN, ov, ev.clientX, ev.clientY);
+        return;
+      }
+    }
+
     // 1. Try to find [data-aid] or [data-svg-proxy-for] by walking up DOM
     let annotId = null;
     let t = ev.target;
@@ -2982,6 +3004,85 @@ function attachOverlayCtxMenu(ov) {
     else { ev.stopPropagation(); hideCtx(); openQuickToolbar(ev.clientX, ev.clientY); }
   }, true); // capture — fires regardless of child pointer-events
 }
+
+// ── REPLACE TEXT — right-click PDF text to overlay it with a note ──
+// Produces an ordinary type:'text' annotation (box:true, opaque) sized to the
+// original text's bounding box, so it visually covers the PDF text underneath
+// with the replacement. Saved/loaded exactly like any other note (.engdoc
+// format), which is what atlas_engine's parse_engdoc()/match_notes() already
+// consume on the Atlas CAD side to write the replacement into the drawing.
+let _rtpState = null; // { items, pageNum, ov } while the popover is open
+
+function _rtpReadingOrder(items) {
+  return [...items].sort((a, b) => {
+    const avgH = ((a.h || 12) + (b.h || 12)) / 2;
+    const lineDiff = (a.y - b.y) / avgH;
+    if (Math.abs(lineDiff) > 0.6) return a.y - b.y;
+    return a.x - b.x;
+  });
+}
+
+function openReplaceTextPopover(items, pageNum, ov, cx, cy) {
+  const ordered = _rtpReadingOrder(items);
+  const oldText = ordered.map(h => h.str).join(' ').replace(/\s+/g, ' ').trim();
+  if (!oldText) return;
+
+  _rtpState = { items: ordered, pageNum, ov };
+
+  document.getElementById('rtp-original').textContent = oldText;
+  const input = document.getElementById('rtp-input');
+  input.value = '';
+
+  const pop = document.getElementById('replace-text-pop');
+  pop.style.left = '0'; pop.style.top = '0';
+  pop.classList.add('open');
+  const pw = pop.offsetWidth, ph = pop.offsetHeight;
+  pop.style.left = Math.min(cx, window.innerWidth  - pw - 8) + 'px';
+  pop.style.top  = Math.min(cy, window.innerHeight - ph - 8) + 'px';
+  setTimeout(() => input.focus(), 30);
+}
+
+function cancelReplaceText() {
+  document.getElementById('replace-text-pop').classList.remove('open');
+  _rtpState = null;
+}
+
+function confirmReplaceText() {
+  if (!_rtpState) return;
+  const newText = document.getElementById('rtp-input').value.trim();
+  if (!newText) { toast('Enter replacement text'); return; }
+
+  const { items, pageNum, ov } = _rtpState;
+  const oldText = items.map(h => h.str).join(' ').replace(/\s+/g, ' ').trim();
+
+  // Bounding box of the selected text run, in CSS px (_pageTextItems stores
+  // y as the text baseline, growing downward, same convention as _selHighlight).
+  let minX = Infinity, minTop = Infinity, maxX = -Infinity, maxBottom = -Infinity;
+  items.forEach(it => {
+    const top = it.y - it.h, bottom = it.y;
+    minX = Math.min(minX, it.x); maxX = Math.max(maxX, it.x + it.w);
+    minTop = Math.min(minTop, top); maxBottom = Math.max(maxBottom, bottom);
+  });
+
+  const ow = ov.offsetWidth, oh = ov.offsetHeight;
+  pushAnnot({
+    id: nextId(), pageNum, type: 'text',
+    x: (minX / ow) * 100, y: (minTop / oh) * 100,
+    w: ((maxX - minX) / ow) * 100, h: ((maxBottom - minTop) / oh) * 100,
+    text: newText, origText: oldText, replacesText: true,
+    Color: 'black', box: true, textAlign: 'center', vAlign: 'center',
+    emmaExclude: true,
+  });
+  toast('Replacement note added — feeds into Atlas CAD via .engdoc export');
+
+  cancelReplaceText();
+  _selClear();
+}
+
+document.addEventListener('mousedown', e => {
+  const pop = document.getElementById('replace-text-pop');
+  if (pop.classList.contains('open') && !pop.contains(e.target)) cancelReplaceText();
+});
 
 // Right-click on empty drawing space (no annotation under the cursor) opens a
 // small floating toolbar for one-click access to the most-used tools, instead
@@ -3165,7 +3266,7 @@ function buildAnnotEl(a) {
     el.style.cssText = `position:absolute;left:${a.x}%;top:${a.y}%;Color:${txtC};` +
       `font-size:${a.fontSize || 13}px;opacity:${(a.opacity ?? 100) / 100};` +
       `display:flex;flex-direction:column;justify-content:${vAlignCss(a.vAlign)};` +
-      (txtBox ? `border:1.5px solid ${txtC};border-radius:3px;background:rgba(255,255,255,.85)` : 'border:none;background:none') +
+      (txtBox ? `border:1.5px solid ${txtC};border-radius:3px;background:${a.replacesText ? '#fff' : 'rgba(255,255,255,.85)'}` : 'border:none;background:none') +
       (a.w !== undefined ? `;width:${a.w}%;min-width:0;max-width:none` : '') +
       (a.h !== undefined ? `;min-height:${a.h}%` : '');
     // Inner wrapper carries the horizontal alignment so it applies to the
