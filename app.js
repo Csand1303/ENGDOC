@@ -3006,7 +3006,7 @@ function attachOverlayCtxMenu(ov) {
       const cx = ev.clientX - r.left, cy = ev.clientY - r.top;
       const pool = _pageTextItems[pageN] || [];
       const hit = pool.find(item => _rectHitsItem(cx - 2, cy - 2, 4, 4, item));
-      if (hit) items = [hit];
+      if (hit) items = _msTextBlockAt(pageN, hit);
     }
     if (items && items.length) {
       ev.stopPropagation();
@@ -3132,6 +3132,81 @@ function _msPagePercentItems() {
     });
   });
   return out;
+}
+
+// A right-click on a single line of a multi-line label (e.g. a MicroStation
+// text node like "MAST REFERENCE\nB43/D04/064\nMASS 851kg") only ever hits
+// the ONE pdf.js text item under the cursor — each line is its own
+// separate item. Walk outward from that item to the lines directly above
+// and below it, stopping as soon as either the vertical gap or the
+// horizontal alignment breaks from what a single multi-line block would
+// look like, so an unrelated line just above/below (a different label
+// entirely) doesn't get swept in.
+const _MS_BLOCK_LINE_GAP_FACTOR = 1.8; // max gap between consecutive lines, as a multiple of their average height
+const _MS_BLOCK_X_OVERLAP_MIN = 0.3;   // min horizontal overlap (fraction of the narrower item's width) to count as "same block"
+
+function _msTextBlockAt(pageNum, clickedItem) {
+  const items = (_pageTextItems[pageNum] || []).filter(it => it.str && it.str.trim());
+  const sorted = [...items].sort((a, b) => a.y - b.y);
+  const idx = sorted.indexOf(clickedItem);
+  if (idx === -1) return [clickedItem];
+
+  const xOverlaps = (a, b) => {
+    const overlap = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+    const minW = Math.min(a.w, b.w) || 1;
+    return overlap / minW >= _MS_BLOCK_X_OVERLAP_MIN;
+  };
+
+  const block = [clickedItem];
+  let cur = clickedItem;
+  for (let i = idx - 1; i >= 0; i--) {
+    const cand = sorted[i];
+    const avgH = ((cur.h || 12) + (cand.h || 12)) / 2;
+    if (cur.y - cand.y > avgH * _MS_BLOCK_LINE_GAP_FACTOR) break;
+    if (!xOverlaps(cand, clickedItem)) break;
+    block.unshift(cand);
+    cur = cand;
+  }
+  cur = clickedItem;
+  for (let i = idx + 1; i < sorted.length; i++) {
+    const cand = sorted[i];
+    const avgH = ((cur.h || 12) + (cand.h || 12)) / 2;
+    if (cand.y - cur.y > avgH * _MS_BLOCK_LINE_GAP_FACTOR) break;
+    if (!xOverlaps(cand, clickedItem)) break;
+    block.push(cand);
+    cur = cand;
+  }
+  return block;
+}
+
+// Joins a set of text items into a string that preserves line structure —
+// items on the same visual line are space-joined, different lines are
+// newline-joined — so a multi-line note's origText matches how a
+// multi-line DGN text node's own string is actually stored (and how
+// _norm_text/_normText compare it: collapsing all whitespace including
+// newlines to single spaces, so this is also exactly comparable against a
+// single-line scanned string when that's what the drawing actually has).
+function _msJoinBlockText(items) {
+  const LINE_THRESHOLD = 0.6;
+  const sorted = [...items].sort((a, b) => {
+    const avgH = ((a.h || 12) + (b.h || 12)) / 2;
+    const lineDiff = (a.y - b.y) / avgH;
+    if (Math.abs(lineDiff) > LINE_THRESHOLD) return a.y - b.y;
+    return a.x - b.x;
+  });
+  const lines = [];
+  let curLine = [], curY = null, curH = 12;
+  sorted.forEach(it => {
+    const avgH = ((curH || 12) + (it.h || 12)) / 2;
+    if (curY !== null && Math.abs(it.y - curY) > avgH * LINE_THRESHOLD) {
+      lines.push(curLine);
+      curLine = [];
+    }
+    curLine.push(it);
+    curY = it.y; curH = it.h || 12;
+  });
+  if (curLine.length) lines.push(curLine);
+  return lines.map(line => line.map(it => it.str).join(' ').trim()).join('\n');
 }
 
 const _MS_ANCHOR_EXPANSION_ROUNDS = 5;
@@ -3369,6 +3444,21 @@ function _rtpRenderCandidates(found, correctionVia) {
     ? `<div class="rtp-correction-note">↳ position refined using nearby "${escHtml(correctionVia)}"</div>`
     : '';
 
+  // Nothing to confirm when there's exactly one unambiguous exact-text
+  // match — auto-bind it and just show a transparent confirmation line
+  // instead of a picker with a single option. Real ambiguity (duplicated
+  // text, or no text match at all) still stops here for review, same as
+  // before.
+  if (textMatches.length === 1) {
+    const c = textMatches[0];
+    box.innerHTML = correctionNote + `
+      <div class="rtp-auto-bound">
+        ✓ Auto-bound to <span class="rtp-cand-eid">#${escHtml(c.eid)}</span> — exact text match, ${c.dist.toFixed(3)} away
+        <input type="radio" name="rtp-target" value="${escHtml(c.eid)}" checked hidden>
+      </div>`;
+    return;
+  }
+
   let html = '<div class="sp-label" style="margin:8px 0 4px">Bind to drawing element</div>' + correctionNote;
 
   if (textMatches.length) {
@@ -3409,7 +3499,7 @@ function _rtpOpen(oldText, prefill, cx, cy, candidates, correctionVia) {
 // Right-click on raw PDF text with nothing already annotated there.
 function openReplaceTextPopover(items, pageNum, ov, cx, cy) {
   const ordered = _rtpReadingOrder(items);
-  const oldText = ordered.map(h => h.str).join(' ').replace(/\s+/g, ' ').trim();
+  const oldText = _msJoinBlockText(ordered);
   if (!oldText) return;
 
   // Bounding box of the selected text run, in CSS px (_pageTextItems stores
