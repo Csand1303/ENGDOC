@@ -3323,7 +3323,29 @@ function _msCalibrate() {
 // Returns { textMatches: [...], nearby: [...] } — nearby is the
 // position-only fallback, always computed too, in case the true element's
 // text has since changed and isn't in the scan verbatim.
-function _msFindCandidates(origText, xPct, yPct, limit, correction) {
+// How many of a scan candidate's cell-sibling texts (see engdoc_notes.py's
+// scan_model_texts() — "context" is the other text found in the same cell
+// instance, e.g. "MAST REFERENCE"/"B43/D04/020" alongside an "E.W.1")
+// actually appear somewhere near the clicked position in the PDF. A
+// duplicated label ("E.W.1" at several masts) carries DIFFERENT context
+// per occurrence — the one whose siblings are actually visible near this
+// click is the real match, by content, not by falling back to distance.
+const _MS_CONTEXT_RADIUS_PX = 200;
+
+function _msContextScore(candidate, pageNum, xPct, yPct) {
+  if (!candidate.context || !candidate.context.length) return 0;
+  const vp = pageViewports[pageNum];
+  const items = _pageTextItems[pageNum];
+  if (!vp || !items) return 0;
+  const xPx = (xPct / 100) * vp.width, yPx = (yPct / 100) * vp.height;
+  const nearbySet = new Set(
+    items.filter(it => Math.hypot(it.x - xPx, it.y - yPx) <= _MS_CONTEXT_RADIUS_PX)
+         .map(it => _normText(it.str))
+  );
+  return candidate.context.reduce((n, c) => n + (nearbySet.has(_normText(c)) ? 1 : 0), 0);
+}
+
+function _msFindCandidates(origText, xPct, yPct, limit, correction, pageNum) {
   if (!_msScan || !_msCalibration) return { textMatches: [], nearby: [] };
   let [px, py] = _msProjectPoint(xPct, yPct, _msCalibration);
   if (correction) { px += correction.dx; py += correction.dy; }
@@ -3332,9 +3354,26 @@ function _msFindCandidates(origText, xPct, yPct, limit, correction) {
                             duplicate: (_msTextCounts[_normText(t.text)] || 0) > 1 });
 
   const key = _normText(origText);
-  const textMatches = key
+  let textMatches = key
     ? _msScan.texts.filter(t => _normText(t.text) === key).map(withDist).sort((a, b) => a.dist - b.dist)
     : [];
+
+  // Duplicated label: see if exactly one candidate's cell-sibling context
+  // is actually present near the click — if so, that's a content-based
+  // disambiguation, strictly more trustworthy than distance, so promote it
+  // to the front and mark it as confirmed (lets the picker auto-bind on it
+  // exactly like a lone unambiguous match).
+  if (textMatches.length > 1 && pageNum != null) {
+    const scored = textMatches.map(c => ({ c, score: _msContextScore(c, pageNum, xPct, yPct) }));
+    scored.sort((a, b) => b.score - a.score);
+    if (scored[0].score > 0 && (scored.length === 1 || scored[0].score > scored[1].score)) {
+      const winner = scored[0].c;
+      winner.contextConfirmed = true;
+      winner.contextMatched = winner.context.filter(c =>
+        _msContextScore({ context: [c] }, pageNum, xPct, yPct) > 0);
+      textMatches = [winner, ...textMatches.filter(t => t !== winner)];
+    }
+  }
 
   const matchedEids = new Set(textMatches.map(t => t.eid));
   const nearby = _msScan.texts
@@ -3445,15 +3484,21 @@ function _rtpRenderCandidates(found, correctionVia) {
     : '';
 
   // Nothing to confirm when there's exactly one unambiguous exact-text
-  // match — auto-bind it and just show a transparent confirmation line
-  // instead of a picker with a single option. Real ambiguity (duplicated
-  // text, or no text match at all) still stops here for review, same as
-  // before.
-  if (textMatches.length === 1) {
-    const c = textMatches[0];
+  // match, OR a duplicated match that was resolved by cell-sibling context
+  // (see _msFindCandidates — e.g. "E.W.1" identified by which mast's
+  // OTHER labels are actually nearby) — auto-bind it and just show a
+  // transparent confirmation line instead of a picker. Real unresolved
+  // ambiguity (duplicated text with no distinguishing context found, or no
+  // text match at all) still stops here for review, same as before.
+  const winner = textMatches[0];
+  if (textMatches.length === 1 || (winner && winner.contextConfirmed)) {
+    const c = winner;
+    const why = c.contextConfirmed
+      ? `identified by nearby "${c.contextMatched.map(escHtml).join('", "')}"`
+      : `exact text match, ${c.dist.toFixed(3)} away`;
     box.innerHTML = correctionNote + `
       <div class="rtp-auto-bound">
-        ✓ Auto-bound to <span class="rtp-cand-eid">#${escHtml(c.eid)}</span> — exact text match, ${c.dist.toFixed(3)} away
+        ✓ Auto-bound to <span class="rtp-cand-eid">#${escHtml(c.eid)}</span> — ${why}
         <input type="radio" name="rtp-target" value="${escHtml(c.eid)}" checked hidden>
       </div>`;
     return;
@@ -3462,7 +3507,7 @@ function _rtpRenderCandidates(found, correctionVia) {
   let html = '<div class="sp-label" style="margin:8px 0 4px">Bind to drawing element</div>' + correctionNote;
 
   if (textMatches.length) {
-    html += `<div class="rtp-group-label">Exact text match${textMatches.length > 1 ? ` (${textMatches.length} — nearest picked by position)` : ''}</div>`;
+    html += `<div class="rtp-group-label">Exact text match${textMatches.length > 1 ? ` (${textMatches.length} — no distinguishing context found nearby, picked by position)` : ''}</div>`;
     html += textMatches.map((c, i) => _rtpCandRow(c, i === 0)).join('');
     if (nearby.length) {
       html += '<div class="rtp-group-label rtp-group-muted">Other nearby (no text match)</div>';
@@ -3527,7 +3572,7 @@ function openReplaceTextPopover(items, pageNum, ov, cx, cy) {
   };
 
   const correction = _msLocalCorrection(pageNum, origX, origY);
-  const found = _msFindCandidates(oldText, origX, origY, 5, correction);
+  const found = _msFindCandidates(oldText, origX, origY, 5, correction, pageNum);
   _rtpOpen(oldText, '', cx, cy, found, correction && correction.via);
 }
 
@@ -3538,7 +3583,7 @@ function openReplaceTextPopoverForEdit(a, cx, cy) {
   let found = { textMatches: [], nearby: [] }, correction = null;
   if (a.origX !== undefined) {
     correction = _msLocalCorrection(a.pageNum, a.origX, a.origY);
-    found = _msFindCandidates(a.origText || '', a.origX, a.origY, 5, correction);
+    found = _msFindCandidates(a.origText || '', a.origX, a.origY, 5, correction, a.pageNum);
   }
   _rtpOpen(a.origText || '', a.text || '', cx, cy, found, correction && correction.via);
 }
