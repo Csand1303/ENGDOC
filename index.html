@@ -127,6 +127,7 @@
   <input type="file" id="fopen-tab" accept=".pdf" style="display:none" onchange="openFileInNewTabFromInput(event)">
   <input type="file" id="fsession" accept=".engdoc" style="display:none" onchange="loadSession(event)">
   <input type="file" id="fmergesession" accept=".engdoc" style="display:none" onchange="mergeSession(event)">
+  <input type="file" id="fmsscan" accept=".json" style="display:none" onchange="loadDrawingScan(event)">
 </div>
 
 <!-- TAB BAR -->
@@ -366,6 +367,10 @@
           <button class="rbtn lg" onclick="document.getElementById('fopen').click()" data-tip="Open a PDF drawing">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M5 12H3l9-9 9 9h-2M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"/></svg>
             <span class="rbtn-label">Open<br>PDF</span>
+          </button>
+          <button class="rbtn lg" onclick="document.getElementById('fmsscan').click()" data-tip="Load a drawing scan exported from Atlas CAD (scan BEFORE markup) — lets Replace Text confirm the exact element for each note">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><path d="M11 8v3l2 1.5"/></svg>
+            <span class="rbtn-label">Load<br>Drawing Scan</span>
           </button>
         </div>
         <div class="rgroup-label">Open</div>
@@ -649,6 +654,7 @@
   <div class="sp-label">Replace Text</div>
   <div id="rtp-original"></div>
   <textarea id="rtp-input" placeholder="Replacement text…"></textarea>
+  <div id="rtp-candidates" hidden></div>
   <div class="rtp-actions">
     <button class="hbtn outline" style="padding:5px 11px;font-size:12px" onclick="cancelReplaceText()">Cancel</button>
     <button class="hbtn primary" style="padding:5px 11px;font-size:12px" onclick="confirmReplaceText()">Replace</button>

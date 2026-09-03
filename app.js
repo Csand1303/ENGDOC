@@ -1545,6 +1545,12 @@ async function renderPageContent(pageNum) {
     const angle = Math.atan2(end[1] - start[1], end[0] - start[0]);
     return { str: item.str, x: start[0], y: start[1], w, h, angle };
   });
+  // A drawing scan loaded before all pages had rendered only had page 1's
+  // (or whichever pages were already lazily rendered) text to calibrate
+  // against — recalibrate now that this page's text joined the corpus, so
+  // multi-page sessions end up using all of it, not just what happened to
+  // be ready first.
+  if (_msScan) _msCalibrate();
 
   // Atomic swap: remove old canvas only after new one is fully rendered
   wrap.querySelector('canvas')?.remove();
@@ -3013,6 +3019,228 @@ function attachOverlayCtxMenu(ov) {
   }, true); // capture — fires regardless of child pointer-events
 }
 
+// ── DRAWING SCAN + CLIENT-SIDE CALIBRATION ──
+// Loading a drawing-scan file (exported from Atlas CAD's "Download scan for
+// EngDoc" button — {texts:[{eid,text,x,y}], range}, taken BEFORE markup
+// begins) lets the "Replace text" tool show the actual nearby drawing
+// elements and have the user CONFIRM which one a note targets, right when
+// they create it. That confirmed eid travels with the note (targetEid) and
+// lets atlas_engine apply it directly with no position/text inference at
+// all — inference is only ever a fallback for notes that don't have one.
+//
+// To do that we need our own page-percent -> DGN-world transform, fit the
+// same way atlas_engine's auto_calibrate() does (see engdoc_notes.py):
+// bootstrap from text that matches exactly one scanned element, then
+// iteratively pull in more anchors by projecting every other PDF text run
+// and accepting any that lands convincingly close to a UNIQUELY-labelled
+// scanned element (never a duplicated one, so this can't be fooled the way
+// blind nearest-neighbour matching could be). Run once per scan load (or
+// PDF change) against the FULL page text, not just notes made so far, so
+// it's ready before the user starts replacing anything.
+let _msScan = null;          // { texts: [{eid,text,x,y}], range } or null
+let _msTextCounts = null;    // normalized text -> count, for duplicate-label detection
+let _msCalibration = null;   // { k_re, k_im, origin_p_x, origin_p_y, origin_d_x, origin_d_y } or null
+
+function _normText(s) {
+  return String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function _cAdd(a, b) { return { re: a.re + b.re, im: a.im + b.im }; }
+function _cSub(a, b) { return { re: a.re - b.re, im: a.im - b.im }; }
+function _cMul(a, b) { return { re: a.re * b.re - a.im * b.im, im: a.re * b.im + a.im * b.re }; }
+function _cConj(a)   { return { re: a.re, im: -a.im }; }
+function _cAbs(a)    { return Math.hypot(a.re, a.im); }
+function _cDiv(a, b) {
+  const d = b.re * b.re + b.im * b.im;
+  return { re: (a.re * b.re + a.im * b.im) / d, im: (a.im * b.re - a.re * b.im) / d };
+}
+
+// Fit a similarity transform (scale+rotation+translation) mapping each `p`
+// to its paired `d` — same math and same single-pair fallback as
+// atlas_engine's _fit_similarity() in engdoc_notes.py.
+function _msFitSimilarity(points) {
+  if (points.length >= 2) {
+    const n = points.length;
+    let pBar = { re: 0, im: 0 }, dBar = { re: 0, im: 0 };
+    points.forEach(([p, d]) => { pBar = _cAdd(pBar, p); dBar = _cAdd(dBar, d); });
+    pBar = { re: pBar.re / n, im: pBar.im / n };
+    dBar = { re: dBar.re / n, im: dBar.im / n };
+    let den = 0;
+    points.forEach(([p]) => { den += _cAbs(_cSub(p, pBar)) ** 2; });
+    if (den < 1e-9) return null;
+    let num = { re: 0, im: 0 };
+    points.forEach(([p, d]) => { num = _cAdd(num, _cMul(_cSub(d, dBar), _cConj(_cSub(p, pBar)))); });
+    const k = { re: num.re / den, im: num.im / den };
+    const t = _cSub(dBar, _cMul(k, pBar));
+    return { k_re: k.re, k_im: k.im, origin_p_x: 0, origin_p_y: 0, origin_d_x: t.re, origin_d_y: t.im };
+  }
+  const originP = { re: 0, im: -100 };
+  const [p, d] = points[0];
+  const denom = _cSub(p, originP);
+  if (_cAbs(denom) < 1e-9) return null;
+  const k = _cDiv(d, denom);
+  return { k_re: k.re, k_im: k.im, origin_p_x: originP.re, origin_p_y: originP.im, origin_d_x: 0, origin_d_y: 0 };
+}
+
+function _msProjectPoint(xPct, yPct, calibration) {
+  const k = { re: calibration.k_re, im: calibration.k_im };
+  const p = { re: xPct, im: -yPct };
+  const originP = { re: calibration.origin_p_x, im: calibration.origin_p_y };
+  const originD = { re: calibration.origin_d_x, im: calibration.origin_d_y };
+  const d = _cAdd(originD, _cMul(k, _cSub(p, originP)));
+  return [d.re, d.im];
+}
+
+function _msTypicalSpacing(texts) {
+  if (texts.length < 2) return null;
+  const nearest = [];
+  texts.forEach((a, i) => {
+    let best = Infinity;
+    texts.forEach((b, j) => {
+      if (i === j) return;
+      const dist = Math.hypot(a.x - b.x, a.y - b.y);
+      if (dist < best) best = dist;
+    });
+    if (best > 0 && best < Infinity) nearest.push(best);
+  });
+  if (!nearest.length) return null;
+  nearest.sort((a, b) => a - b);
+  const mid = Math.floor(nearest.length / 2);
+  return nearest.length % 2 ? nearest[mid] : (nearest[mid - 1] + nearest[mid]) / 2;
+}
+
+// Every PDF text item across every rendered page, in page-percent — the
+// full corpus used to bootstrap and expand the calibration (not just notes
+// made so far).
+function _msPagePercentItems() {
+  const out = [];
+  Object.keys(_pageTextItems).forEach(pnStr => {
+    const pn = parseInt(pnStr);
+    const vp = pageViewports[pn];
+    if (!vp) return;
+    (_pageTextItems[pn] || []).forEach(it => {
+      if (!it.str || !it.str.trim()) return;
+      out.push({ text: it.str, x: (it.x / vp.width) * 100, y: (it.y / vp.height) * 100 });
+    });
+  });
+  return out;
+}
+
+const _MS_ANCHOR_EXPANSION_ROUNDS = 5;
+
+function _msCalibrate() {
+  _msCalibration = null;
+  if (!_msScan || !_msScan.texts || !_msScan.texts.length) return;
+
+  const msByText = {};
+  _msTextCounts = {};
+  _msScan.texts.forEach(t => {
+    const k = _normText(t.text);
+    (msByText[k] = msByText[k] || []).push(t);
+    _msTextCounts[k] = (_msTextCounts[k] || 0) + 1;
+  });
+
+  const pageItems = _msPagePercentItems();
+  if (!pageItems.length) return;
+
+  let pairs = []; // [{itemIdx, ms}]
+  const claimedIdx = new Set();
+  pageItems.forEach((it, idx) => {
+    const key = _normText(it.text);
+    if (!key) return;
+    const cands = msByText[key];
+    if (cands && cands.length === 1) { pairs.push({ itemIdx: idx, ms: cands[0] }); claimedIdx.add(idx); }
+  });
+  pageItems.forEach((it, idx) => {
+    if (claimedIdx.has(idx)) return;
+    const key = _normText(it.text);
+    if (!key) return;
+    const cands = _msScan.texts.filter(t => {
+      const tk = _normText(t.text);
+      return tk.includes(key) || key.includes(tk);
+    });
+    if (cands.length === 1) { pairs.push({ itemIdx: idx, ms: cands[0] }); claimedIdx.add(idx); }
+  });
+
+  if (!pairs.length) return;
+
+  const pointOf = pr => [{ re: pageItems[pr.itemIdx].x, im: -pageItems[pr.itemIdx].y },
+                          { re: pr.ms.x, im: pr.ms.y }];
+  let points = pairs.map(pointOf);
+  let calibration = _msFitSimilarity(points);
+  if (!calibration) return;
+
+  const uniqueMs = _msScan.texts.filter(t => (_msTextCounts[_normText(t.text)] || 0) === 1);
+  const spacing = _msTypicalSpacing(_msScan.texts);
+
+  for (let round = 0; round < _MS_ANCHOR_EXPANSION_ROUNDS; round++) {
+    const curResiduals = points.map(([p, d]) => {
+      const [px, py] = _msProjectPoint(p.re, -p.im, calibration);
+      return Math.hypot(px - d.re, py - d.im);
+    });
+    let tol = curResiduals.length ? Math.max(...curResiduals) * 3 : 0;
+    tol = Math.max(tol, (spacing || 0) * 0.5);
+    if (tol <= 0) break;
+
+    const claimedEids = new Set(pairs.map(pr => pr.ms.eid));
+    const claimedItemIdx = new Set(pairs.map(pr => pr.itemIdx));
+    const remaining = pageItems.map((it, idx) => idx).filter(idx => !claimedItemIdx.has(idx));
+    if (!remaining.length) break;
+
+    const found = [];
+    remaining.forEach(idx => {
+      const it = pageItems[idx];
+      const [px, py] = _msProjectPoint(it.x, it.y, calibration);
+      let best = null;
+      uniqueMs.forEach(ms => {
+        if (claimedEids.has(ms.eid)) return;
+        const dist = Math.hypot(ms.x - px, ms.y - py);
+        if (!best || dist < best[0]) best = [dist, ms];
+      });
+      if (best && best[0] <= tol) found.push({ itemIdx: idx, ms: best[1] });
+    });
+    if (!found.length) break;
+
+    found.forEach(pr => { pairs.push(pr); points.push(pointOf(pr)); });
+    const refit = _msFitSimilarity(points);
+    if (!refit) break;
+    calibration = refit;
+  }
+
+  _msCalibration = calibration;
+}
+
+// Nearest N scanned elements to a page-percent point, for the replace-text
+// candidate picker — sorted closest first, flagged when their label isn't
+// unique in the drawing.
+function _msNearestCandidates(xPct, yPct, limit) {
+  if (!_msScan || !_msCalibration) return [];
+  const [px, py] = _msProjectPoint(xPct, yPct, _msCalibration);
+  return _msScan.texts
+    .map(t => ({ ...t, dist: Math.hypot(t.x - px, t.y - py),
+                 duplicate: (_msTextCounts[_normText(t.text)] || 0) > 1 }))
+    .sort((a, b) => a.dist - b.dist)
+    .slice(0, limit || 5);
+}
+
+async function loadDrawingScan(e) {
+  const f = e.target.files && e.target.files[0];
+  if (!f) return;
+  try {
+    const raw = JSON.parse(await f.text());
+    const texts = Array.isArray(raw.texts) ? raw.texts : null;
+    if (!texts) throw new Error('missing "texts" array — is this a drawing-scan file from Atlas CAD?');
+    _msScan = { texts, range: raw.range || null };
+    _msCalibrate();
+    toast(_msCalibration
+      ? `✓ Drawing scan loaded — ${texts.length} element(s), calibrated`
+      : `Drawing scan loaded — ${texts.length} element(s), but no text matched yet to calibrate from`);
+  } catch (err) {
+    toast('Could not read drawing scan: ' + err.message);
+  }
+  e.target.value = '';
+}
+
 // ── REPLACE TEXT — right-click PDF text to overlay it with a note ──
 // Produces an ordinary type:'text' annotation (box:true, opaque) sized to the
 // original text's bounding box, so it visually covers the PDF text underneath
@@ -3028,7 +3256,7 @@ function attachOverlayCtxMenu(ov) {
 // they line up with a scanned DGN text element's origin far better than an
 // arbitrary box corner would, which measurably improves match_notes()'s
 // nearest-element matching on drawings with closely-spaced text.
-let _rtpState = null; // { mode:'create', items, pageNum, ov } | { mode:'edit', annotId }
+let _rtpState = null; // { mode:'create', pageNum, x,y,w,h,origX,origY,oldText, candidates } | { mode:'edit', annotId }
 
 function _rtpReadingOrder(items) {
   return [...items].sort((a, b) => {
@@ -3039,10 +3267,29 @@ function _rtpReadingOrder(items) {
   });
 }
 
-function _rtpOpen(oldText, prefill, cx, cy) {
+function _rtpRenderCandidates(candidates, selectedEid) {
+  const box = document.getElementById('rtp-candidates');
+  if (!candidates || !candidates.length) { box.innerHTML = ''; box.hidden = true; return; }
+  box.hidden = false;
+  box.innerHTML = '<div class="sp-label" style="margin:8px 0 4px">Bind to drawing element</div>' +
+    candidates.map((c, i) => `
+      <label class="rtp-cand">
+        <input type="radio" name="rtp-target" value="${escHtml(c.eid)}" ${i === 0 ? 'checked' : ''}>
+        <span class="rtp-cand-text">${escHtml(c.text)}</span>
+        <span class="rtp-cand-dist">${c.dist.toFixed(3)}${c.duplicate ? ' · ⚠ dup label' : ''}</span>
+      </label>`).join('');
+}
+
+function _rtpSelectedTargetEid() {
+  const checked = document.querySelector('#rtp-candidates input[name="rtp-target"]:checked');
+  return checked ? checked.value : null;
+}
+
+function _rtpOpen(oldText, prefill, cx, cy, candidates) {
   document.getElementById('rtp-original').textContent = oldText || '(no original text on record)';
   const input = document.getElementById('rtp-input');
   input.value = prefill || '';
+  _rtpRenderCandidates(candidates);
 
   const pop = document.getElementById('replace-text-pop');
   pop.style.left = '0'; pop.style.top = '0';
@@ -3059,47 +3306,9 @@ function openReplaceTextPopover(items, pageNum, ov, cx, cy) {
   const oldText = ordered.map(h => h.str).join(' ').replace(/\s+/g, ' ').trim();
   if (!oldText) return;
 
-  _rtpState = { mode: 'create', items: ordered, pageNum, ov };
-  _rtpOpen(oldText, '', cx, cy);
-}
-
-// "Replace text…" from the ctx-menu on an existing type:'text' note — lets
-// you correct/retype the replacement without deleting and re-creating it.
-function openReplaceTextPopoverForEdit(a, cx, cy) {
-  _rtpState = { mode: 'edit', annotId: a.id };
-  _rtpOpen(a.origText || '', a.text || '', cx, cy);
-}
-
-function cancelReplaceText() {
-  document.getElementById('replace-text-pop').classList.remove('open');
-  _rtpState = null;
-}
-
-function confirmReplaceText() {
-  if (!_rtpState) return;
-  const newText = document.getElementById('rtp-input').value.trim();
-  if (!newText) { toast('Enter replacement text'); return; }
-
-  if (_rtpState.mode === 'edit') {
-    const a = annots.find(x => x.id === _rtpState.annotId);
-    if (a) {
-      if (!a.origText) a.origText = a.text;
-      a.text = newText;
-      a.replacesText = true;
-      syncAnnots(); updateAnnotPanel(); updateEmmaRegister(); snapshotState();
-      toast('Replacement updated');
-    }
-    cancelReplaceText();
-    return;
-  }
-
-  const { items, pageNum, ov } = _rtpState;
-  const ordered = items; // already reading-order sorted by the caller
-  const oldText = ordered.map(h => h.str).join(' ').replace(/\s+/g, ' ').trim();
-
   // Bounding box of the selected text run, in CSS px (_pageTextItems stores
   // y as the text baseline, growing downward, same convention as _selHighlight)
-  // — used for the note's visual size/position, unchanged from before.
+  // — used for the note's visual size/position.
   let minX = Infinity, minTop = Infinity, maxX = -Infinity, maxBottom = -Infinity;
   ordered.forEach(it => {
     const top = it.y - it.h, bottom = it.y;
@@ -3111,18 +3320,65 @@ function confirmReplaceText() {
   // left/baseline point — a real point straight from the PDF's text
   // transform, not a derived box corner.
   const anchor = ordered[0];
-
   const ow = ov.offsetWidth, oh = ov.offsetHeight;
-  pushAnnot({
-    id: nextId(), pageNum, type: 'text',
+  const origX = (anchor.x / ow) * 100, origY = (anchor.y / oh) * 100;
+
+  _rtpState = {
+    mode: 'create', pageNum, oldText,
     x: (minX / ow) * 100, y: (minTop / oh) * 100,
     w: ((maxX - minX) / ow) * 100, h: ((maxBottom - minTop) / oh) * 100,
-    origX: (anchor.x / ow) * 100, origY: (anchor.y / oh) * 100,
+    origX, origY,
+  };
+
+  const candidates = _msNearestCandidates(origX, origY, 5);
+  _rtpOpen(oldText, '', cx, cy, candidates);
+}
+
+// "Replace text…" from the ctx-menu on an existing type:'text' note — lets
+// you correct/retype the replacement without deleting and re-creating it.
+function openReplaceTextPopoverForEdit(a, cx, cy) {
+  _rtpState = { mode: 'edit', annotId: a.id };
+  const candidates = (a.origX !== undefined) ? _msNearestCandidates(a.origX, a.origY, 5) : [];
+  _rtpOpen(a.origText || '', a.text || '', cx, cy, candidates);
+}
+
+function cancelReplaceText() {
+  document.getElementById('replace-text-pop').classList.remove('open');
+  _rtpState = null;
+}
+
+function confirmReplaceText() {
+  if (!_rtpState) return;
+  const newText = document.getElementById('rtp-input').value.trim();
+  if (!newText) { toast('Enter replacement text'); return; }
+  const targetEid = _rtpSelectedTargetEid();
+
+  if (_rtpState.mode === 'edit') {
+    const a = annots.find(x => x.id === _rtpState.annotId);
+    if (a) {
+      if (!a.origText) a.origText = a.text;
+      a.text = newText;
+      a.replacesText = true;
+      if (targetEid) a.targetEid = targetEid;
+      syncAnnots(); updateAnnotPanel(); updateEmmaRegister(); snapshotState();
+      toast(targetEid ? 'Replacement updated — bound to drawing element' : 'Replacement updated');
+    }
+    cancelReplaceText();
+    return;
+  }
+
+  const { pageNum, oldText, x, y, w, h, origX, origY } = _rtpState;
+  pushAnnot({
+    id: nextId(), pageNum, type: 'text',
+    x, y, w, h, origX, origY,
     text: newText, origText: oldText, replacesText: true,
+    targetEid: targetEid || undefined,
     Color: 'black', box: true, textAlign: 'center', vAlign: 'center',
     emmaExclude: true,
   });
-  toast('Replacement note added — feeds into Atlas CAD via .engdoc export');
+  toast(targetEid
+    ? 'Replacement note added — bound to a confirmed drawing element'
+    : 'Replacement note added — feeds into Atlas CAD via .engdoc export');
 
   cancelReplaceText();
   _selClear();
@@ -4284,6 +4540,15 @@ async function loadSession(e) {
       _loadedEngdocName = file.name;
     }
 
+    // A single-file "export for EngDoc" bundle from Atlas CAD carries the
+    // drawing scan alongside the embedded PDF above — load it and
+    // calibrate immediately so Replace Text's candidate picker is ready
+    // before the user has made a single note.
+    if (data.msScan && Array.isArray(data.msScan.texts)) {
+      _msScan = data.msScan;
+      _msCalibrate();
+    }
+
     annots = migrateLegacyAnnots(data.annots);
     emmaRows = data.emmaRows || {};
     annotIdSeq = data.annotIdSeq || annots.reduce((m, a) => Math.max(m, a.id || 0), 0);
@@ -4300,7 +4565,10 @@ async function loadSession(e) {
       });
     }
     syncAnnots(); updateAnnotPanel(); updateStatusCount(); updateEmmaRegister(); updateEmmaDash();
-    toast(`✓ Loaded: ${annots.length} annotation${annots.length !== 1 ? 's' : ''}${data.v === 3 ? ' (with embedded PDF)' : ''}`);
+    const scanNote = _msScan
+      ? ` — drawing scan loaded (${_msScan.texts.length} element${_msScan.texts.length !== 1 ? 's' : ''}${_msCalibration ? ', calibrated' : ', not yet calibrated'})`
+      : '';
+    toast(`✓ Loaded: ${annots.length} annotation${annots.length !== 1 ? 's' : ''}${data.v === 3 ? ' (with embedded PDF)' : ''}${scanNote}`);
   } catch(err) {
     toast('Failed to load session: ' + err.message);
   }
